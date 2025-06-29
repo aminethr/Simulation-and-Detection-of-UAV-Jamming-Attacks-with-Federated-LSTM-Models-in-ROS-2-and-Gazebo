@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float32
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+import math
+import csv
+import os
+from datetime import datetime
+
+class RSSISimulator(Node):
+    def __init__(self):
+        super().__init__('rssi_simulator')
+
+        # === Sensor Fixed Position ===
+        # You can change this to match the fixed base station position
+        self.sensor_x = 0.0
+        self.sensor_y = 0.0
+        self.sensor_z = 0.0
+
+        # === Signal and Channel Parameters ===
+
+        # RSSI at 1m distance (in dBm)
+        # Change this for jammed vs. normal conditions
+        self.rssi_at_1m = -20.0     # normal: -20.0 | jammed: -40.0
+
+        # Path loss exponent (free space ~2.0, urban > 2.7)
+        self.path_loss_exponent = 2.0
+
+        # Noise and interference (in dBm)
+        self.noise_dBm = -100.0      # normal: -100.0 | jammed: -95.0
+        self.interference_dBm = -90.0  # normal: -90.0 | jammed: -45.0 (strong jammer)
+
+        # === ROS 2 Setup ===
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        # Subscribing to drone position
+        self.create_subscription(
+            PoseStamped,
+            '/drone0/local_position/pose',  # Change this topic if using different drone or namespace
+            self.pose_callback,
+            qos
+        )
+
+        # Publishing RSSI and SNIR values
+        self.rssi_pub = self.create_publisher(Float32, '/drone0/simulated_rssi', 10)
+        self.snir_pub = self.create_publisher(Float32, '/drone0/simulated_snir', 10)
+
+        # === Logging Setup ===
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Change this path for jammed vs normal data folders
+        folder = "/home/amine/Desktop/drones_data/drone0/normal"  # or "jammed"
+        os.makedirs(folder, exist_ok=True)
+
+        self.csv_path = os.path.join(folder, f"drone_0_rssi_log_{timestamp}.csv")
+        self.csv_file = open(self.csv_path, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(['Timestamp', 'Distance (m)', 'RSSI (dBm)', 'SNIR (dB)'])
+
+        self.get_logger().info(f'📡 RSSI simulator node started. Logging to: {self.csv_path}')
+
+    def pose_callback(self, msg):
+        # === Extract drone position ===
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        z = msg.pose.position.z
+
+        # === Calculate distance from sensor to drone ===
+        distance = math.sqrt(
+            (x - self.sensor_x) ** 2 +
+            (y - self.sensor_y) ** 2 +
+            (z - self.sensor_z) ** 2
+        )
+        distance = max(distance, 0.01)  # Avoid log(0)
+
+        # === RSSI Calculation (Log-distance path loss model) ===
+        rssi = self.rssi_at_1m - 10 * self.path_loss_exponent * math.log10(distance)
+
+        # === Convert RSSI, noise, interference to power (mW) ===
+        p_signal = 10 ** (rssi / 10)
+        p_noise = 10 ** (self.noise_dBm / 10)
+        p_interference = 10 ** (self.interference_dBm / 10)
+
+        # === SNIR Calculation ===
+        snir = p_signal / (p_noise + p_interference)
+        snir_db = 10 * math.log10(snir)
+
+        # === Publish values ===
+        self.rssi_pub.publish(Float32(data=rssi))
+        self.snir_pub.publish(Float32(data=snir_db))
+
+        # === Log to CSV ===
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.csv_writer.writerow([now, distance, rssi, snir_db])
+
+        # === Optional logging in terminal ===
+        self.get_logger().info(f'📍 Distance: {distance:.2f} m | 📶 RSSI: {rssi:.2f} dBm | 🔊 SNIR: {snir_db:.2f} dB')
+
+    def destroy_node_and_close_file(self):
+        # Close CSV file safely on shutdown
+        if self.csv_file and not self.csv_file.closed:
+            self.csv_file.close()
+            self.get_logger().info(f"📁 CSV file saved at: {self.csv_path}")
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RSSISimulator()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("🛑 Shutting down and saving file...")
+    finally:
+        node.destroy_node_and_close_file()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+

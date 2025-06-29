@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+from scapy.all import sniff, Raw
+from pymavlink import mavutil
+from datetime import datetime, timedelta
+import io
+from collections import defaultdict
+import hashlib
+import csv
+import os
+import threading
+import signal
+import sys
+import time
+import re
+
+# === MAVLink parser initialization ===
+mav_parser = mavutil.mavlink.MAVLink(io.BytesIO(), srcSystem=255, srcComponent=0)
+mav_parser.robust_parsing = True  # Allows parsing even with slight corruption
+
+# === Tracking variables ===
+prev_seq = defaultdict(lambda: -1)  # Track previous sequence number per (sys_id, comp_id)
+total_drops = 0
+total_received = 0
+msg_times = []  # Store timestamps of messages received in last 1 second
+interval_drops = 0
+
+# === Message cache to prevent double-counting ===
+processed_messages = set()
+last_cleanup = datetime.now()
+MESSAGE_CACHE_TIME = timedelta(seconds=2)
+
+# === Threading control ===
+lock = threading.Lock()
+stop_event = threading.Event()
+
+# === Manual setting for scenario ===
+# Set to True if you are testing with jamming (e.g., flooding UDP port)
+IS_JAMMING = False  # ⚠️ Change this depending on your test scenario
+
+# === Logging setup ===
+base_dir = "/home/amine/Desktop/drones_data/drone1"
+subfolder = "jammed" if IS_JAMMING else "normal"
+output_dir = os.path.join(base_dir, subfolder)
+os.makedirs(output_dir, exist_ok=True)
+
+def get_next_csv_filename(base_name="mavlink_stats", extension=".csv", folder="."):
+    """Return a filename with an incrementing sequence number based on existing files in given folder."""
+    existing_files = [f for f in os.listdir(folder) if re.match(rf'{base_name}(_\d+)?{extension}', f)]
+    max_num = 0
+    for f in existing_files:
+        match = re.search(r'_(\d+)', f)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+    next_num = max_num + 1
+    return f"{base_name}_{next_num}{extension}"
+
+csv_file = os.path.join(output_dir, get_next_csv_filename(folder=output_dir))
+csv_fp = open(csv_file, mode='a', newline='')
+csv_writer = csv.writer(csv_fp)
+
+# Write CSV header
+csv_writer.writerow([
+    "timestamp", "total_received", "drops_in_last_sec", "msgs_per_sec", "loss_rate"
+])
+
+# === Utility Functions ===
+
+def get_message_hash(msg):
+    """Create a unique hash for a MAVLink message to avoid double-processing."""
+    try:
+        key = (msg.get_srcSystem(), msg.get_srcComponent(), msg.get_msgId(),
+               msg.get_seq(), hash(str(msg.to_dict())))
+        return hashlib.md5(str(key).encode()).hexdigest()
+    except Exception:
+        return None
+
+def handle_packet(packet):
+    """Handle incoming packet and extract MAVLink messages."""
+    global total_received, total_drops, last_cleanup, interval_drops
+
+    if not packet.haslayer(Raw):
+        return
+
+    now = datetime.now()
+    data = bytes(packet[Raw].load)
+
+    # Clear old processed hashes every 2 seconds
+    if (now - last_cleanup) > MESSAGE_CACHE_TIME:
+        with lock:
+            processed_messages.clear()
+        last_cleanup = now
+
+    try:
+        msgs = mav_parser.parse_buffer(data)
+        if not isinstance(msgs, list):
+            msgs = [msgs] if msgs else []
+
+        for msg in msgs:
+            if msg is None:
+                continue
+
+            try:
+                seq = msg.get_seq()
+                sys_id = msg.get_srcSystem()
+                comp_id = msg.get_srcComponent()
+            except AttributeError:
+                continue
+
+            msg_hash = get_message_hash(msg)
+            if not msg_hash:
+                continue
+
+            with lock:
+                if msg_hash in processed_messages:
+                    continue  # Skip duplicates
+                processed_messages.add(msg_hash)
+
+                total_received += 1
+
+                # Drop detection logic
+                prev = prev_seq[(sys_id, comp_id)]
+                if prev >= 0:
+                    expected_seq = (prev + 1) % 256
+                    if seq != expected_seq:
+                        if seq > expected_seq:
+                            drops = seq - expected_seq
+                        else:
+                            drops = (256 - expected_seq) + seq
+                        if drops > 100:
+                            drops = 1  # Ignore large jump (possibly a reset)
+                        total_drops += drops
+                        interval_drops += drops
+                prev_seq[(sys_id, comp_id)] = seq
+
+                # Track time for message rate
+                msg_times.append(now)
+                cutoff = now - timedelta(seconds=1)
+                while msg_times and msg_times[0] < cutoff:
+                    msg_times.pop(0)
+
+    except Exception as e:
+        print(f"⚠️ Error processing packet: {e}")
+
+def periodic_logger():
+    """Print and log packet stats every second."""
+    global interval_drops
+
+    while not stop_event.is_set():
+        time.sleep(1)
+        with lock:
+            now = datetime.now()
+            msgs_per_sec = len([t for t in msg_times if t > now - timedelta(seconds=1)])
+            total_attempted = total_received + total_drops
+            loss_rate = (total_drops / total_attempted) if total_attempted > 0 else 0.0
+
+            print(f"✅ [{now.strftime('%H:%M:%S')}] Received: {total_received}, "
+                  f"Drops: {interval_drops}, Msgs/Sec: {msgs_per_sec}, Loss Rate: {loss_rate:.2%}")
+
+            csv_writer.writerow([
+                now.strftime('%Y-%m-%d %H:%M:%S'),
+                total_received,
+                interval_drops,
+                msgs_per_sec,
+                f"{loss_rate:.6f}"
+            ])
+            csv_fp.flush()
+
+            interval_drops = 0
+
+def graceful_exit(sig, frame):
+    """Clean exit on Ctrl+C or kill signal."""
+    print("\n🛑 Stopping and saving CSV...")
+    stop_event.set()
+    csv_fp.close()
+    sys.exit(0)
+
+# === Register signal handlers for clean shutdown ===
+signal.signal(signal.SIGINT, graceful_exit)
+signal.signal(signal.SIGTERM, graceful_exit)
+
+print(f"📡 Sniffing MAVLink packets on UDP port 14550... Saving logs to {csv_file}")
+print("🔁 Press Ctrl+C to stop.\n")
+
+# Start logging thread
+threading.Thread(target=periodic_logger, daemon=True).start()
+
+# Start sniffing UDP traffic
+sniff(filter="udp port 14550", prn=handle_packet, store=False)
+
